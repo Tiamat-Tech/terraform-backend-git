@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2025-12-08
+
+### Added
+
+- Clone only most recent commits (thanks @jmholla!)
+- Added age option for SOPS encryption (thanks @Renerick!)
+- Upgrade to go 1.24 and all dependencies
+
 ## [0.1.8] - 2024-11-16
 
 ### Added
