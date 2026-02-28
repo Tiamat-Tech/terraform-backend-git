@@ -36,14 +36,41 @@ func init() {
 func authBasicHTTP() (*http.BasicAuth, error) {
 	username, okUsername := os.LookupEnv("GIT_USERNAME")
 	if !okUsername {
-		return nil, errors.New("Git protocol was http but username was not set")
+		return nil, errors.New("Git protocol was http but username was not set (GIT_USERNAME)")
 	}
 
 	password, okPassword := os.LookupEnv("GIT_PASSWORD")
 	if !okPassword {
+		if passwordFile, ok := os.LookupEnv("GIT_PASSWORD_FILE"); ok {
+			v, err := credentialFiles.readTrimmed(passwordFile)
+			if err != nil {
+				if errors.Is(err, errCredentialFileEmpty) {
+					return nil, errors.New("Git protocol was http but password file was empty (GIT_PASSWORD_FILE)")
+				}
+				return nil, err
+			}
+			password = v
+			okPassword = true
+		}
+	}
+
+	if !okPassword {
 		ghToken, okGhToken := os.LookupEnv("GITHUB_TOKEN")
 		if !okGhToken {
-			return nil, errors.New("Git protocol was http but neither password nor token was set")
+			if ghTokenFile, ok := os.LookupEnv("GITHUB_TOKEN_FILE"); ok {
+				v, err := credentialFiles.readTrimmed(ghTokenFile)
+				if err != nil {
+					if errors.Is(err, errCredentialFileEmpty) {
+						return nil, errors.New("Git protocol was http but token file was empty (GITHUB_TOKEN_FILE)")
+					}
+					return nil, err
+				}
+				ghToken = v
+				okGhToken = true
+			}
+		}
+		if !okGhToken {
+			return nil, errors.New("Git protocol was http but neither password nor token was set (GIT_PASSWORD/GIT_PASSWORD_FILE/GITHUB_TOKEN/GITHUB_TOKEN_FILE)")
 		}
 		password = ghToken
 	}
@@ -160,9 +187,10 @@ func ref(branch string, remote bool) plumbing.ReferenceName {
 // newStorageSession makes a fresh clone to in-memory FS and saves everything to the StorageSession
 func newStorageSession(params *RequestMetadataParams) (*storageSession, error) {
 	storageSession := &storageSession{
-		storer: memory.NewStorage(),
-		fs:     memfs.New(),
-		mutex:  sync.Mutex{},
+		remoteURL: params.Repository,
+		storer:    memory.NewStorage(),
+		fs:        memfs.New(),
+		mutex:     sync.Mutex{},
 	}
 
 	if err := storageSession.clone(params); err != nil {
@@ -179,8 +207,6 @@ func (storageSession *storageSession) clone(params *RequestMetadataParams) error
 		return err
 	}
 
-	storageSession.auth = auth
-
 	cloneOptions := &git.CloneOptions{
 		URL:           params.Repository,
 		Auth:          auth,
@@ -193,7 +219,7 @@ func (storageSession *storageSession) clone(params *RequestMetadataParams) error
 		// we actually care about. The depth here prevents performance problems from
 		// history growth. sparse-checkouts help with horizontal growth (e.g., additional
 		// systems managed by the repository).
-		Depth:		   1,
+		Depth: 1,
 	}
 
 	repository, err := git.Clone(storageSession.storer, storageSession.fs, cloneOptions)
@@ -215,6 +241,14 @@ func (storageSession *storageSession) getRemote() (*git.Remote, error) {
 	}
 
 	return remote, nil
+}
+
+func (storageSession *storageSession) remoteAuth() (transport.AuthMethod, error) {
+	if storageSession.remoteURL == "" {
+		return nil, errors.New("Remote repository URL is not set")
+	}
+
+	return auth(&RequestMetadataParams{Repository: storageSession.remoteURL})
 }
 
 // CheckoutMode configures checkout behaviour
@@ -258,6 +292,11 @@ func (storageSession *storageSession) checkout(branch string, mode CheckoutMode)
 // This branch must already exist locally and upstream must be set for it to know where to pull from.
 // It will ignore git.NoErrAlreadyUpToDate.
 func (storageSession *storageSession) pull(branch string) error {
+	auth, err := storageSession.remoteAuth()
+	if err != nil {
+		return err
+	}
+
 	tree, err := storageSession.repository.Worktree()
 	if err != nil {
 		return err
@@ -266,7 +305,7 @@ func (storageSession *storageSession) pull(branch string) error {
 	pullOptions := git.PullOptions{
 		ReferenceName: ref(branch, false),
 		Force:         true,
-		Auth:          storageSession.auth,
+		Auth:          auth,
 	}
 
 	if err := tree.Pull(&pullOptions); err != nil && err != git.NoErrAlreadyUpToDate {
@@ -285,9 +324,14 @@ var (
 // Attempt to fetch from remote for specified ref specs.
 // It will ignore git.NoErrAlreadyUpToDate.
 func (storageSession *storageSession) fetch(refs []config.RefSpec) error {
+	auth, err := storageSession.remoteAuth()
+	if err != nil {
+		return err
+	}
+
 	fetchOptions := git.FetchOptions{
 		RefSpecs: refs,
-		Auth:     storageSession.auth,
+		Auth:     auth,
 	}
 
 	remote, err := storageSession.getRemote()
@@ -321,11 +365,16 @@ func (storageSession *storageSession) deleteBranch(branch string, deleteRemote b
 		return err
 	}
 
+	auth, err := storageSession.remoteAuth()
+	if err != nil {
+		return err
+	}
+
 	pushOptions := &git.PushOptions{
 		RefSpecs: []config.RefSpec{
 			config.RefSpec(":" + ref),
 		},
-		Auth: storageSession.auth,
+		Auth: auth,
 	}
 
 	if err := remote.Push(pushOptions); err != nil && err != git.NoErrAlreadyUpToDate {
@@ -423,7 +472,12 @@ func (storageSession *storageSession) pushWithOptions(opts git.PushOptions) erro
 		return err
 	}
 
-	opts.Auth = storageSession.auth
+	auth, err := storageSession.remoteAuth()
+	if err != nil {
+		return err
+	}
+
+	opts.Auth = auth
 	return remote.Push(&opts)
 }
 
